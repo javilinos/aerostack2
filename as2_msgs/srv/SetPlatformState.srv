@@ -1,0 +1,12 @@
+# SERVICE TYPE: SetPlatformState
+# ------------------------------------------------------------------------------
+# Hot-teleport a simulated platform to a given kinematic state.
+
+geometry_msgs/Pose pose                 # Earth-frame position + orientation
+geometry_msgs/Vector3 linear_velocity   # Earth frame, m/s
+geometry_msgs/Vector3 angular_velocity  # Body frame, rad/s
+bool reset_to_hover                     # If true, switch control mode to HOVER after teleport
+---
+bool success
+string message
+# ------------------------------------------------------------------------------
