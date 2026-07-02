@@ -44,6 +44,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/point.hpp>
+#include <actuator_msgs/msg/actuators.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -125,6 +126,17 @@ private:
   // Gimbal
   geometry_msgs::msg::QuaternionStamped gimbal_desired_orientation_;
   rclcpp::Subscription<as2_msgs::msg::GimbalControl>::SharedPtr gimbal_control_sub_;
+
+  // Direct per-motor command passthrough (RL "motor" action mode). The RL env
+  // streams the 4 motor angular velocities (rad/s) to actuator_command/motors;
+  // the callback drives the simulator's MOTOR_W control mode — the motor speeds
+  // go straight to the dynamics with NO inner attitude/rate controller (the
+  // policy is the controller). motor_speed publishes the actual (lagged) motor
+  // speeds back for the observation. Mirrors how rates bypasses the motion
+  // controller via actuator_command/{twist,thrust}.
+  rclcpp::Subscription<actuator_msgs::msg::Actuators>::SharedPtr motors_command_sub_;
+  rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr motor_speed_pub_;
+  void motorsCommandCallback(const actuator_msgs::msg::Actuators::SharedPtr msg);
 
   // Hot-teleport service. Binds to `/<namespace>/set_platform_state` (the
   // relative name resolves against the platform node's namespace, which is

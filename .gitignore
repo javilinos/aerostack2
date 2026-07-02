@@ -67,4 +67,3 @@ doxygen/
 compile_commands.json
 COLCON_IGNORE
 thirdparties/
-as2_aerial_platforms/

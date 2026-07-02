@@ -234,7 +234,7 @@ class DroneInterfaceBase(Node):
         """Drone inner spin."""
         while self.keep_running and rclpy.ok():
             self.__executor.spin_once(timeout_sec=0)
-            sleep(self.__spin_interval)
+            # sleep(self.__spin_interval)
 
     def shutdown(self) -> None:
         """Shutdown properly."""

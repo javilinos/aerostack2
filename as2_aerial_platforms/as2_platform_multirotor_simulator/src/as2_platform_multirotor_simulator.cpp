@@ -142,6 +142,16 @@ void MultirotorSimulatorPlatform::configureSensors()
     "platform/" + gimbal_name + "/gimbal_command", 10,
     std::bind(&MultirotorSimulatorPlatform::gimbalControlCallback, this, std::placeholders::_1));
 
+  // Direct per-motor command passthrough (RL "motor" action mode). Relative
+  // names resolve under the drone namespace, matching the env's
+  // /<ns>/actuator_command/motors and /<ns>/motor_speed. SensorData QoS to
+  // match the env's best-effort pub/sub.
+  motors_command_sub_ = this->create_subscription<actuator_msgs::msg::Actuators>(
+    "actuator_command/motors", rclcpp::SensorDataQoS(),
+    std::bind(&MultirotorSimulatorPlatform::motorsCommandCallback, this, std::placeholders::_1));
+  motor_speed_pub_ = this->create_publisher<actuator_msgs::msg::Actuators>(
+    "motor_speed", rclcpp::SensorDataQoS());
+
   geometry_msgs::msg::Transform gimbal_transform;
   getParam("gimbal.base_transform.x", gimbal_transform.translation.x);
   getParam("gimbal.base_transform.y", gimbal_transform.translation.y);
@@ -491,6 +501,24 @@ void MultirotorSimulatorPlatform::gimbalControlCallback(
     roll, pitch, yaw, gimbal_desired_orientation_.quaternion);
 }
 
+void MultirotorSimulatorPlatform::motorsCommandCallback(
+  const actuator_msgs::msg::Actuators::SharedPtr msg)
+{
+  if (msg->velocity.size() < 4) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "actuator_command/motors needs >= 4 velocities, got %zu", msg->velocity.size());
+    return;
+  }
+  // Drive the simulator's direct-actuation mode: motor speeds (rad/s) go
+  // straight to the dynamics, bypassing the inner controller. set_control_mode
+  // is a no-op once already in MOTOR_W, so calling it per command is cheap.
+  Eigen::Matrix<double, 4, 1> w;
+  w << msg->velocity[0], msg->velocity[1], msg->velocity[2], msg->velocity[3];
+  simulator_.set_control_mode(multirotor::ControlMode::MOTOR_W);
+  simulator_.set_refence_motors_angular_velocity(w);
+}
+
 Eigen::Vector3d MultirotorSimulatorPlatform::readVectorParams(const std::string & param_name)
 {
   Eigen::Vector3d default_value = Eigen::Vector3d::Zero();  // Default value
@@ -571,6 +599,19 @@ void MultirotorSimulatorPlatform::readParams(PlatformParams & platform_params)
     readVectorParams("multirotor.dynamics.model.vehicle_inertia").asDiagonal();
   getParam(
     "multirotor.dynamics.model.vehicle_drag_coefficient", dp.model_params.vehicle_drag_coefficient);
+  // Optional rotor-coupled linear drag (MonoRace k_x term); defaults to 0 when
+  // the config omits it, so other UAV configs are unaffected.
+  getParam(
+    "multirotor.dynamics.model.rotor_drag_coefficient",
+    dp.model_params.rotor_drag_coefficient, true);
+  // Optional body-frame anisotropic quadratic drag [x,y,z]; [0,0,0] if absent.
+  dp.model_params.body_quadratic_drag =
+    readVectorParams("multirotor.dynamics.model.body_quadratic_drag");
+  // Optional MonoRace thrust aero-droop; default 0 (disabled) if absent.
+  getParam("multirotor.dynamics.model.thrust_k_angle", dp.model_params.thrust_k_angle, true);
+  getParam("multirotor.dynamics.model.thrust_k_hor", dp.model_params.thrust_k_hor, true);
+  getParam(
+    "multirotor.dynamics.model.thrust_aero_radius", dp.model_params.thrust_aero_radius, true);
   dp.model_params.vehicle_aero_moment_coefficient =
     readVectorParams("multirotor.dynamics.model.vehicle_aero_moment_coefficient").asDiagonal();
   getParam(
@@ -590,9 +631,46 @@ void MultirotorSimulatorPlatform::readParams(PlatformParams & platform_params)
   getParam("multirotor.dynamics.model.motors_params.max_speed", max_speed);
   getParam("multirotor.dynamics.model.motors_params.time_constant", time_constant);
   getParam("multirotor.dynamics.model.motors_params.rotational_inertia", rotational_inertia);
-  dp.model_params.motors_params = multirotor::model::Model<double, 4>::create_quadrotor_x_config(
-    thrust_coefficient, torque_coefficient, x_dist, y_dist, min_speed, max_speed, time_constant,
-    rotational_inertia);
+
+  // Optional ASYMMETRIC per-motor layout. If motors_x / motors_y /
+  // motors_direction are all provided (each length 4) they define each motor's
+  // body-frame position and spin direction independently, so the model can
+  // reproduce a real (non-symmetric) quad frame — different roll/pitch torque
+  // arms per motor. Otherwise fall back to the symmetric quad-X helper built
+  // from x_dist / y_dist (backward compatible with existing configs). The
+  // mixer and the INDI mixer-inverse are computed from these motors_params
+  // below, so an asymmetric layout propagates consistently to the controller.
+  std::vector<double> motors_x, motors_y, motors_direction;
+  getParam("multirotor.dynamics.model.motors_params.motors_x", motors_x, true);
+  getParam("multirotor.dynamics.model.motors_params.motors_y", motors_y, true);
+  getParam("multirotor.dynamics.model.motors_params.motors_direction", motors_direction, true);
+
+  if (motors_x.size() == 4 && motors_y.size() == 4 && motors_direction.size() == 4) {
+    std::vector<multirotor::model::MotorParams<double>> motors;
+    motors.reserve(4);
+    for (size_t i = 0; i < 4; ++i) {
+      multirotor::model::MotorParams<double> motor;
+      motor.thrust_coefficient = thrust_coefficient;
+      motor.torque_coefficient = torque_coefficient;
+      motor.min_speed = min_speed;
+      motor.max_speed = max_speed;
+      motor.time_constant = time_constant;
+      motor.rotational_inertia = rotational_inertia;
+      // +1 = CW, -1 = CCW (matches Model::create_quadrotor_x_config).
+      motor.motor_rotation_direction = (motors_direction[i] >= 0.0) ? 1 : -1;
+      motor.pose = multirotor::model::MotorParams<double>::IsometryTypeP::Identity();
+      motor.pose.translation() = Eigen::Vector3d(motors_x[i], motors_y[i], 0.0);
+      motors.push_back(motor);
+    }
+    dp.model_params.motors_params = motors;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Multirotor model: ASYMMETRIC per-motor layout from motors_x/y/direction.");
+  } else {
+    dp.model_params.motors_params = multirotor::model::Model<double, 4>::create_quadrotor_x_config(
+      thrust_coefficient, torque_coefficient, x_dist, y_dist, min_speed, max_speed, time_constant,
+      rotational_inertia);
+  }
 
   // Controller params Indi
   SimulatorParams::ControllerParams & cp = simulator_params_.controller_params;
@@ -729,6 +807,14 @@ void MultirotorSimulatorPlatform::simulatorControlTimerCallback()
   }
 
   simulator_.update_controller(dt, control_state_);
+
+  // Publish the actual (lagged) motor angular velocities for the RL observation
+  // — the source for the "motor mode" rpm obs channels. Cheap at control_freq.
+  const auto & motor_w = simulator_.get_actuation_motors_angular_velocity();
+  actuator_msgs::msg::Actuators motor_msg;
+  motor_msg.header.stamp = current_time;
+  motor_msg.velocity = {motor_w[0], motor_w[1], motor_w[2], motor_w[3]};
+  motor_speed_pub_->publish(motor_msg);
 }
 
 void MultirotorSimulatorPlatform::simulatorInertialOdometryTimerCallback()

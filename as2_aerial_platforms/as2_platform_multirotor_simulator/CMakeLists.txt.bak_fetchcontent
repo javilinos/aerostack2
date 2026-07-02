@@ -31,13 +31,19 @@ foreach(DEPENDENCY ${PROJECT_DEPENDENCIES})
   find_package(${DEPENDENCY} REQUIRED)
 endforeach()
 
-# VENDORED, PATCHED multirotor_simulator. Replaces the upstream
-# FetchContent(RPS98 v2.0) with our local copy carrying the MonoRace physics
-# edits (rotor-coupled drag, anisotropic body drag, thrust aero-droop) +
-# asymmetric per-motor support, so a clean build in this workspace always uses
-# our dynamics instead of silently re-fetching stock v2.0. The INTERFACE target
-# `multirotor_simulator` provides the include dir; see vendor_multirotor_simulator/.
-add_subdirectory(vendor_multirotor_simulator)
+# Add project submodules
+if(${multirotor_simulator_FOUND})
+  message(STATUS "multirotor_simulator found")
+else()
+  message(STATUS "multirotor_simulator not found")
+  include(FetchContent)
+  fetchcontent_declare(
+    multirotor_simulator
+    GIT_REPOSITORY https://github.com/RPS98/multirotor_simulator.git
+    GIT_TAG v2.0
+  )
+  fetchcontent_makeavailable(multirotor_simulator)
+endif()
 
 # Include necessary directories
 include_directories(
@@ -46,8 +52,8 @@ include_directories(
 
   {EIGEN3_INCLUDE_DIRS}
 
-  # Vendored patched multirotor_simulator headers (root holds multirotor_simulator.hpp)
-  ${CMAKE_CURRENT_SOURCE_DIR}/vendor_multirotor_simulator/multirotor_simulator
+  # Incluye multirotor_simulator
+  ${CMAKE_BINARY_DIR}/_deps/multirotor_simulator-src/include
 )
 
 # Set source files
